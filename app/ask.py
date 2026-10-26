@@ -1,43 +1,62 @@
-"""第1回: 素のLLMに1回だけ質問するスクリプトを変更して
-    モデルとtemperatureを変更して計6回違う条件で聞くスクリプト。
+"""1つのモデルに、共通の会話履歴を与えてtemperatureを比較するスクリプト。
 
 使い方:
     uv run python -m app.ask "LoRAとは何ですか？"
-    uv run python -m app.ask            # 質問を省略すると、講座に固有の質問をする
+    uv run python -m app.ask
 
-ツールも会話履歴も持たない「素の」呼び出し。
-講座に固有のことを聞くと、「分からない」と答えるか、一般論でもっともらしく答える
-（講座の実際とは違う）ことを確かめよう。
-（第3回で、用語集を検索できるエージェントにして改善する）
+各ターンでtemperature 0.2と1.0の回答を表示する。
+次のターンに進むときに採用する回答を選ぶことで、両方の条件に同じ会話履歴を渡す。
 """
 
-# argparseは、実行時にコマンドライン引数（質問文）を受け取るための標準ライブラリ。
 import argparse
 
-# google-genai SDKから、Gemini APIの呼び出しに使うクライアントとエラー型を読み込む。
+# Gemini SDKの会話履歴はContent形式で渡すため、その型と履歴引数用のSequenceを使う。
+from collections.abc import Sequence
+from dataclasses import dataclass
+
 from google import genai
-from google.genai import errors
+from google.genai import errors, types
 
-# アプリ共通設定から、モデル名・APIエラー文の生成・APIキー取得の関数を読み込む。
-from app.config import MODEL, api_error_message, get_api_key
+from app.config import FALLBACK_MODELS, MODEL, api_error_message, get_api_key
 
-# 質問を省略したときに使う、講座固有の例題。
-# このスクリプトは用語集を参照しないため、正しい情報を持たない状態で回答する。
 DEFAULT_QUESTION = "AIE2026の講座の宿題にある「3レベル」とは何ですか？"
+# 毎ターン、この2つのtemperatureで同じ質問・履歴に対する回答を比較する。
+TEMPERATURES = (0.2, 1.0)
 
 
-def ask(question: str, model_name: str, temperature: float) -> str:
-    # APIキーを使ってクライアントを作り、指定モデルに質問を1回だけ送る。
-    # 会話履歴や追加の資料は渡していない。
+@dataclass(frozen=True)
+class AskResult:
+    """表示用の回答文と、会話履歴に使うSDKの応答を保持する。"""
+
+    text: str
+    content: types.Content
+
+
+class EmptyModelResponseError(RuntimeError):
+    """モデルが会話に追加できる回答を返さなかったことを示す。"""
+
+
+def ask(
+    question: str,
+    temperature: float = 0.2,
+    history: Sequence[types.Content] = (),
+    model_name: str = MODEL,
+) -> AskResult:
+    """共通の会話履歴と質問を指定temperatureでモデルに送り、回答を返す。"""
     client = genai.Client(api_key=get_api_key())
+    # 過去の会話の後ろに今回の質問を追加し、同じ履歴を各temperatureに渡す。
+    contents = [
+        *history,
+        types.Content(role="user", parts=[types.Part(text=question)]),
+    ]
     response = client.models.generate_content(
+        # 呼び出し元が選んだモデルを使い、temperatureだけを比較対象にする。
         model=model_name,
-        contents=question,
-        config={"temperature": temperature, "max_output_tokens": 300}
-        )
+        contents=contents,
+        config={"temperature": temperature, "max_output_tokens": 300},
+    )
 
-    # APIが利用量を返していれば入力・出力トークン数を表示する。
-    # 利用量情報がない場合は None を保持し、表示時に「不明」とする。
+    # APIがトークン使用量を返さない場合もあるため、不明として表示する。
     usage = response.usage_metadata
     input_tokens = usage.prompt_token_count if usage is not None else None
     output_tokens = usage.candidates_token_count if usage is not None else None
@@ -46,35 +65,102 @@ def ask(question: str, model_name: str, temperature: float) -> str:
         f"出力: {output_tokens if output_tokens is not None else '不明'}"
     )
 
-    # 呼び出し元にモデルの回答本文を返す。
-    return response.text
+    # 回答本文だけで作り直すとthought signatureなどSDK応答の情報が失われる。
+    candidates = response.candidates
+    if not candidates or candidates[0].content is None or response.text is None:
+        raise EmptyModelResponseError("モデルから会話に使えるテキスト回答がありませんでした。")
+    return AskResult(text=response.text, content=candidates[0].content)
 
 
 def main() -> None:
-    model_list = ["gemini-3.8-flash","gemini-3.1-flash-lite","gemini-4-31b-it"]
-    temperature_list = [0.2, 1.0]
-    # コマンドライン引数の質問を受け取る。省略時は講座固有の例題を使う。
-    parser = argparse.ArgumentParser(description="素のLLMに質問する")
+    parser = argparse.ArgumentParser(
+        description="会話を続けながらtemperatureによる回答の違いを比べる"
+    )
     parser.add_argument("question", nargs="?", default=DEFAULT_QUESTION)
     args = parser.parse_args()
 
-    # 使用するモデルと、実際に送る質問を先に表示する。
-    # コメントアウトした　print(f"[model] {MODEL}")
-    print(f"[質問] {args.question}\n")
+    # 両条件の比較で共有する履歴。会話開始時は空にする。
+    history: list[types.Content] = []
+    question = args.question
+    print(f"[質問] {question}")
 
-    # APIエラーは受講生向けの説明文に変換して表示し、失敗終了にする。
-    try:
-        for model_name in model_list:
-            for temperature in temperature_list:
-                print(f"\n[model]{model_name} / [temperature]{temperature}")
-                answer = ask(args.question, model_name, temperature)
-                print(answer)
-    
-    except errors.APIError as e:
-        print(api_error_message(e.code, e.message))
-        raise SystemExit(1)
+    # 設定モデルを最初に試し、失敗時は重複を除いた予備モデルへ進む。
+    model_candidates = tuple(dict.fromkeys((MODEL, *FALLBACK_MODELS)))
+
+    while True:
+        for model_name in model_candidates:
+            answers: dict[float, AskResult] = {}
+            print(f"\n[model] {model_name}")
+            try:
+                # 1つのモデルで両temperatureが成功したときだけ、その比較を採用する。
+                for temperature in TEMPERATURES:
+                    print(f"\n[temperature] {temperature}")
+                    answers[temperature] = ask(
+                        question, temperature, history, model_name
+                    )
+            except EmptyModelResponseError as e:
+                # 空の回答を会話履歴に混ぜず、次のモデルを試す。
+                print(f"[失敗] {model_name}: {e}")
+                continue
+            except errors.APIError as e:
+                # 一方の温度で失敗しても部分的な比較結果は使わず、次のモデルへ進む。
+                print(
+                    f"[失敗] {model_name}: {api_error_message(e.code, e.message)}"
+                )
+                continue
+
+            for temperature in TEMPERATURES:
+                print(f"\n[temperature] {temperature}")
+                print(answers[temperature].text)
+            break
+        else:
+            # すべての候補が失敗した場合は理由を示して失敗終了する。
+            print("[エラー] 利用できるモデルがありません。モデル設定を確認してください。")
+            raise SystemExit(1)
+
+        # 成功したモデル名を表示することで、予備モデルへの切り替えを知らせる。
+        if model_name != MODEL:
+            print(f"\n[予備モデルを使用] {model_name}")
+
+        # 次のターンに採用する回答を選び、想定外の入力は選び直してもらう。
+        while True:
+            choice = input(
+                "\n次の会話に使う回答を選んでください "
+                "(1 または 0.2: temperature 0.2 / "
+                "2 または 1.0: temperature 1.0 / q: 終了): "
+            ).strip().lower()
+            if choice == "q":
+                break
+            if choice in ("1", "0.2"):
+                selected_temperature = TEMPERATURES[0]
+                break
+            if choice in ("2", "1.0"):
+                selected_temperature = TEMPERATURES[1]
+                break
+            print("選択を読み取れませんでした。1、0.2、2、1.0、または q を入力してください。")
+
+        if choice == "q":
+            break
+
+        # 選ばれた回答だけを履歴に追加し、次ターンも両条件で共有する。
+        history.extend(
+            [
+                types.Content(
+                    role="user",
+                    parts=[types.Part(text=question)],
+                ),
+                # 返ってきたContentをそのまま使い、signatureなどの情報を保持する。
+                answers[selected_temperature].content,
+            ]
+        )
+        # 続きの質問を受け取り、qまたは空入力なら会話を終える。
+        question = input("\n次の質問 (終了: q): ").strip()
+        if question.lower() == "q":
+            break
+        if not question:
+            print("質問が空なので終了します。")
+            break
 
 
 if __name__ == "__main__":
-    # `python -m app.ask` などで直接実行されたときだけ main を開始する。
     main()
