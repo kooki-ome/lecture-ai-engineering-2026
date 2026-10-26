@@ -82,9 +82,12 @@ pyproject.toml / uv.lock  依存パッケージとその固定版
 ## モデルの切り替え
 
 既定モデルは `gemini-3.5-flash-lite` です。環境変数 `AIE_MODEL` で切り替えられます。
+`app.ask` は設定モデルでエラーが起きた場合、既定の予備モデル `gemini-3.5-flash` を試します。
+予備モデルは環境変数 `AIE_FALLBACK_MODELS` にカンマ区切りで指定できます。
 
 ```bash
 AIE_MODEL=gemini-3.5-flash uv run python -m app.ask "LoRAとは何ですか？"
+AIE_MODEL=gemini-3.5-flash-lite AIE_FALLBACK_MODELS=gemini-3.5-flash,gemini-3.1-flash-lite uv run python -m app.ask "LoRAとは何ですか？"
 ```
 
 無料枠には1分あたり・1日あたりのリクエスト上限があります。上限は [Gemini API のレート制限のページ](https://ai.google.dev/gemini-api/docs/rate-limits) で確認してください。
