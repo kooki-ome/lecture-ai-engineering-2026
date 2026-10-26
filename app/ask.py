@@ -1,14 +1,16 @@
-"""1つのモデルに、共通の会話履歴を与えてtemperatureを比較するスクリプト。
+"""Flash、Flash-Lite、Gemmaの回答とtemperatureを比較するスクリプト。
 
 使い方:
     uv run python -m app.ask "LoRAとは何ですか？"
     uv run python -m app.ask
 
-各ターンでtemperature 0.2と1.0の回答を表示する。
-次のターンに進むときに採用する回答を選ぶことで、両方の条件に同じ会話履歴を渡す。
+各系列で利用可能な最新モデルから順に試し、temperature 0.2と1.0の回答を表示する。
+次のターンに使う回答を選び、全モデルに同じ会話履歴を渡す。
 """
 
 import argparse
+import re
+from time import perf_counter
 
 # Gemini SDKの会話履歴はContent形式で渡すため、その型と履歴引数用のSequenceを使う。
 from collections.abc import Sequence
@@ -17,11 +19,13 @@ from dataclasses import dataclass
 from google import genai
 from google.genai import errors, types
 
-from app.config import FALLBACK_MODELS, MODEL, api_error_message, get_api_key
+from app.config import MODEL, api_error_message, get_api_key
 
 DEFAULT_QUESTION = "AIE2026の講座の宿題にある「3レベル」とは何ですか？"
-# 毎ターン、この2つのtemperatureで同じ質問・履歴に対する回答を比較する。
-TEMPERATURES = (0.2, 1.0)
+# 各ターンで同じ質問・履歴に対する回答を比較する。
+TEMPERATURES = (0.2,)
+MODEL_FAMILIES = ("Flash", "Flash-Lite", "Gemma")
+MAX_MODEL_VERSIONS = 3
 
 
 @dataclass(frozen=True)
@@ -34,6 +38,77 @@ class AskResult:
 
 class EmptyModelResponseError(RuntimeError):
     """モデルが会話に追加できる回答を返さなかったことを示す。"""
+
+
+def _model_id(model: types.Model) -> str:
+    """モデル一覧のリソース名からAPI呼び出し用のモデルIDを取り出す。"""
+    return (model.name or "").rsplit("/", maxsplit=1)[-1]
+
+
+def _model_family(model_id: str) -> str | None:
+    """モデルIDを比較対象の系列に分類する。"""
+    model_id = model_id.lower()
+    if model_id.startswith("gemma-"):
+        return "Gemma"
+    if model_id.startswith("gemini-") and "flash-lite" in model_id:
+        return "Flash-Lite"
+    if model_id.startswith("gemini-") and "flash" in model_id:
+        return "Flash"
+    return None
+
+
+def _model_sort_key(model_id: str) -> tuple[bool, tuple[int, ...], bool, int, str]:
+    """latest別名、バージョン、安定版、Gemmaのパラメーター数で候補を並べる。"""
+    version_match = re.search(r"(?:gemini|gemma)-(\d+(?:\.\d+)*)", model_id)
+    version = (
+        tuple(int(part) for part in version_match.group(1).split("."))
+        if version_match
+        else ()
+    )
+    parameter_match = re.search(r"-(\d+)b(?:-|$)", model_id)
+    parameter_count = int(parameter_match.group(1)) if parameter_match else 0
+    return (
+        model_id.endswith("-latest"),
+        version,
+        "preview" not in model_id,
+        parameter_count,
+        model_id,
+    )
+
+
+def discover_model_candidates() -> dict[str, tuple[str, ...]]:
+    """APIが利用可能と返すモデルから、各系列の新しい候補を最大3件選ぶ。"""
+    client = genai.Client(api_key=get_api_key())
+    candidates: dict[str, list[str]] = {family: [] for family in MODEL_FAMILIES}
+    for model in client.models.list():
+        model_id = _model_id(model)
+        family = _model_family(model_id)
+        if family is None:
+            continue
+        if (
+            model.supported_actions is not None
+            and "generateContent" not in model.supported_actions
+        ):
+            continue
+        candidates[family].append(model_id)
+
+    ordered: dict[str, tuple[str, ...]] = {}
+    for family, model_ids in candidates.items():
+        model_ids.sort(key=_model_sort_key, reverse=True)
+        if family == "Gemma":
+            # Gemmaは同じ世代にサイズ違いが複数あるため、旧世代へ順にフォールバックする。
+            unique_versions: dict[tuple[int, ...], str] = {}
+            for model_id in model_ids:
+                match = re.search(r"gemma-(\d+(?:\.\d+)*)", model_id)
+                version = (
+                    tuple(int(part) for part in match.group(1).split("."))
+                    if match
+                    else ()
+                )
+                unique_versions.setdefault(version, model_id)
+            model_ids = list(unique_versions.values())
+        ordered[family] = tuple(model_ids[:MAX_MODEL_VERSIONS])
+    return ordered
 
 
 def ask(
@@ -49,12 +124,14 @@ def ask(
         *history,
         types.Content(role="user", parts=[types.Part(text=question)]),
     ]
+    start_time = perf_counter()
     response = client.models.generate_content(
         # 呼び出し元が選んだモデルを使い、temperatureだけを比較対象にする。
         model=model_name,
         contents=contents,
         config={"temperature": temperature, "max_output_tokens": 300},
     )
+    response_time = perf_counter() - start_time
 
     # APIがトークン使用量を返さない場合もあるため、不明として表示する。
     usage = response.usage_metadata
@@ -64,6 +141,7 @@ def ask(
         f"[トークン] 入力: {input_tokens if input_tokens is not None else '不明'} / "
         f"出力: {output_tokens if output_tokens is not None else '不明'}"
     )
+    print(f"[応答時間] {response_time:.2f}秒")
 
     # 回答本文だけで作り直すとthought signatureなどSDK応答の情報が失われる。
     candidates = response.candidates
@@ -74,70 +152,82 @@ def ask(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="会話を続けながらtemperatureによる回答の違いを比べる"
+        description="Flash、Flash-Lite、Gemmaの回答を比較する"
     )
     parser.add_argument("question", nargs="?", default=DEFAULT_QUESTION)
     args = parser.parse_args()
+
+    try:
+        model_candidates = discover_model_candidates()
+    except errors.APIError as e:
+        print(f"[エラー] モデル一覧を取得できませんでした: {api_error_message(e.code, e.message)}")
+        raise SystemExit(1) from e
 
     # 両条件の比較で共有する履歴。会話開始時は空にする。
     history: list[types.Content] = []
     question = args.question
     print(f"[質問] {question}")
 
-    # 設定モデルを最初に試し、失敗時は重複を除いた予備モデルへ進む。
-    model_candidates = tuple(dict.fromkeys((MODEL, *FALLBACK_MODELS)))
-
     while True:
-        for model_name in model_candidates:
-            answers: dict[float, AskResult] = {}
-            print(f"\n[model] {model_name}")
-            try:
-                # 1つのモデルで両temperatureが成功したときだけ、その比較を採用する。
-                for temperature in TEMPERATURES:
-                    print(f"\n[temperature] {temperature}")
-                    answers[temperature] = ask(
-                        question, temperature, history, model_name
-                    )
-            except EmptyModelResponseError as e:
-                # 空の回答を会話履歴に混ぜず、次のモデルを試す。
-                print(f"[失敗] {model_name}: {e}")
-                continue
-            except errors.APIError as e:
-                # 一方の温度で失敗しても部分的な比較結果は使わず、次のモデルへ進む。
-                print(
-                    f"[失敗] {model_name}: {api_error_message(e.code, e.message)}"
-                )
+        successful_answers: dict[str, tuple[str, dict[float, AskResult]]] = {}
+        for family in MODEL_FAMILIES:
+            family_candidates = model_candidates[family]
+            if not family_candidates:
+                print(f"\n[候補なし] {family} 系列の利用可能なモデルがありません。")
                 continue
 
-            for temperature in TEMPERATURES:
-                print(f"\n[temperature] {temperature}")
-                print(answers[temperature].text)
-            break
-        else:
-            # すべての候補が失敗した場合は理由を示して失敗終了する。
+            for model_name in family_candidates:
+                answers: dict[float, AskResult] = {}
+                print(f"\n[モデル確認] {family}: {model_name}")
+                try:
+                    for temperature in TEMPERATURES:
+                        answers[temperature] = ask(
+                            question, temperature, history, model_name
+                        )
+                except EmptyModelResponseError as e:
+                    print(f"[失敗] {model_name}: {e}")
+                except errors.APIError as e:
+                    print(
+                        f"[失敗] {model_name}: "
+                        f"{api_error_message(e.code, e.message)}"
+                    )
+                else:
+                    successful_answers[family] = (model_name, answers)
+                    break
+
+            if family not in successful_answers:
+                print(f"[失敗] {family} 系列で利用できるモデルがありませんでした。")
+
+        if not successful_answers:
             print("[エラー] 利用できるモデルがありません。モデル設定を確認してください。")
             raise SystemExit(1)
 
-        # 成功したモデル名を表示することで、予備モデルへの切り替えを知らせる。
-        if model_name != MODEL:
-            print(f"\n[予備モデルを使用] {model_name}")
+        answer_options: dict[str, AskResult] = {}
+        print("\n[比較結果]")
+        for family in MODEL_FAMILIES:
+            if family not in successful_answers:
+                continue
+            model_name, answers = successful_answers[family]
+            print(f"\n[{family}] 使用モデル: {model_name}")
+            for temperature in TEMPERATURES:
+                answer = answers[temperature]
+                print(f"\n[temperature] {temperature}")
+                print(answer.text)
+                option = str(len(answer_options) + 1)
+                answer_options[option] = answer
+                print(f"[選択肢 {option}] {family} / temperature {temperature}")
 
-        # 次のターンに採用する回答を選び、想定外の入力は選び直してもらう。
+        # 選んだ系列・temperatureの回答だけを、次の会話履歴に使う。
         while True:
             choice = input(
-                "\n次の会話に使う回答を選んでください "
-                "(1 または 0.2: temperature 0.2 / "
-                "2 または 1.0: temperature 1.0 / q: 終了): "
+                "\n次の会話に使う回答の選択肢番号を入力してください (q: 終了): "
             ).strip().lower()
             if choice == "q":
                 break
-            if choice in ("1", "0.2"):
-                selected_temperature = TEMPERATURES[0]
+            if choice in answer_options:
+                selected_answer = answer_options[choice]
                 break
-            if choice in ("2", "1.0"):
-                selected_temperature = TEMPERATURES[1]
-                break
-            print("選択を読み取れませんでした。1、0.2、2、1.0、または q を入力してください。")
+            print("選択を読み取れませんでした。表示された番号、または q を入力してください。")
 
         if choice == "q":
             break
@@ -149,8 +239,7 @@ def main() -> None:
                     role="user",
                     parts=[types.Part(text=question)],
                 ),
-                # 返ってきたContentをそのまま使い、signatureなどの情報を保持する。
-                answers[selected_temperature].content,
+                selected_answer.content,
             ]
         )
         # 続きの質問を受け取り、qまたは空入力なら会話を終える。
