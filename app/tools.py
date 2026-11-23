@@ -4,13 +4,11 @@
 説明文を書き換えると、モデルがツールを使うかどうか・どんな引数で呼ぶかが変わる。
 """
 
-import re
-from datetime import datetime
-from zoneinfo import ZoneInfo
 import json
-import random
 from functools import cache
 from pathlib import Path
+
+from app.config import api_error_message
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 MAX_RESULTS = 3
@@ -83,52 +81,48 @@ def get_lecture_summary(lecture: int) -> str:
     return path.read_text(encoding="utf-8")
 
 
-def make_quiz(lecture: int) -> str:
-    """指定した会の用語から一つを選び、確認問題と答えを返す。
-    「第二回の確認問題を出して」のように言われた時に使う。
+def search_materials(query: str) -> str:
+    """第1〜3回の本講義資料を検索し、関連ページの本文・タイトル・ページ番号を返す。
+
+    queryに調べたい内容を指定する。
     """
-    # 1. load_glossary()からlectureが一致する用語集を集める
-    terms = [term for term in load_glossary() if term["lecture"] == lecture]
-    if not terms:
-        return f"第{lecture}回の用語は用語集にありません。"
+    from google.genai.errors import APIError
+    import sqlite3
+    from app.retrieval import search
 
-    # 2. 一つ選ぶ(random.choice)
-    term = random.choice(terms)
+    try:
+        return json.dumps({"results": search(query)}, ensure_ascii=False)
+    except (ValueError, FileNotFoundError, sqlite3.Error) as e:
+        return json.dumps({"error": str(e), "results": []}, ensure_ascii=False)
+    except APIError as e:
+        return json.dumps({"error": api_error_message(e.code), "results": []}, ensure_ascii=False)
 
-    # 3. 問題と答えを文字列で返す(json.dumps　など)
-    return json.dumps(
-        {
-            "question": f"「{term['term']}」とは何ですか？",
-            "answer": term["definition"],
-        },
-        ensure_ascii=False,
-    )
 
-def save_learning_log(filename: str, content: str) -> str:
-    """利用者の学びや気づきを learning_log/ に Markdown で保存する。
+def browse_tree(node_id: str | None = None) -> str:
+    """目次とページの先頭文を返す。ページIDを指定すると全文を返す。
 
-    利用者が「学んだ」「わかった」「覚えておいて」など、学習した内容を伝えてきたときに使う。
-    保存前に利用者の承認が入る。
-
-    Args:
-        filename: トピックを表す短い名前。例: "ツール"。日付と .md は自動で付くので書かない。
-        content: Markdown 本文。学んだこと・関係する回を箇条書きでまとめる。
+    最初はnode_idを省略する。続いて返されたIDを指定して目次をたどる。
     """
+    from app.retrieval import browse_tree as browse
 
-    log_dir = Path("learning_log")
-    log_dir.mkdir(exist_ok=True)
+    try:
+        return json.dumps(browse(node_id), ensure_ascii=False)
+    except (ValueError, OSError) as e:
+        return json.dumps({"error": str(e)}, ensure_ascii=False)
 
-    # 日付はモデルに推測させず、コード側で今日の日付を付ける
-    # （モデルが日付を付けてきても一度取り除いてから付け直す）
-    topic = re.sub(r"^\d{4}-\d{2}-\d{2}_?", "", filename)
-    today = datetime.now(ZoneInfo("Asia/Tokyo")).date().isoformat()  # 日本時間の日付
-    filename = f"{today}_{topic}"
 
-    # 拡張子がなければ .md を付ける
-    if not filename.endswith(".md"):
-        filename += ".md"
+def search_graph(query: str) -> str:
+    """資料を検索し、前後ページ・共通用語をたどって関連ページの本文と引用情報を返す。
 
-    save_path = log_dir / filename
-    save_path.write_text(content, encoding="utf-8")
+    queryに調べたい内容を指定する。
+    """
+    import sqlite3
+    from google.genai.errors import APIError
+    from app.retrieval import search_graph as search
 
-    return f"学習記録を {save_path} に保存しました。"
+    try:
+        return json.dumps(search(query), ensure_ascii=False)
+    except (ValueError, OSError, sqlite3.Error) as e:
+        return json.dumps({"error": str(e)}, ensure_ascii=False)
+    except APIError as e:
+        return json.dumps({"error": api_error_message(e.code)}, ensure_ascii=False)
